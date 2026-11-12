@@ -46,6 +46,50 @@ CREATE TABLE IF NOT EXISTS meta (
     value INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO meta(key, value) VALUES ('state_version', 0);
+
+-- ---------------------------------------------------------------------------
+-- 模型评估：预测 / 真值 / 逐图片贡献 / 3x3 计数矩阵
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS predictions (
+    model_id   TEXT NOT NULL,
+    image_id   TEXT NOT NULL REFERENCES images(image_id),
+    label      TEXT NOT NULL CHECK (label IN ('normal', 'scratch', 'dent')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (model_id, image_id)
+);
+CREATE INDEX IF NOT EXISTS idx_predictions_image ON predictions(image_id);
+
+CREATE TABLE IF NOT EXISTS ground_truths (
+    image_id   TEXT PRIMARY KEY REFERENCES images(image_id),
+    revision   INTEGER NOT NULL CHECK (revision > 0),
+    label      TEXT NOT NULL CHECK (label IN ('normal', 'scratch', 'dent')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- 逐图片 × 模型的矩阵贡献：一行代表对 eval_matrices 中
+-- (model_id, partition, truth_label, pred_label) 单元 +1 的持久化贡献。
+-- 仅当图片所在组已分区且预测、真值齐备时存在；每次只重算受影响图片的行。
+CREATE TABLE IF NOT EXISTS eval_contributions (
+    model_id    TEXT NOT NULL,
+    image_id    TEXT NOT NULL,
+    partition   TEXT NOT NULL CHECK (partition IN ('train', 'val')),
+    truth_label TEXT NOT NULL CHECK (truth_label IN ('normal', 'scratch', 'dent')),
+    pred_label  TEXT NOT NULL CHECK (pred_label IN ('normal', 'scratch', 'dent')),
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (model_id, image_id)
+);
+CREATE INDEX IF NOT EXISTS idx_contrib_image ON eval_contributions(image_id);
+
+-- 按 模型 × 分区 维护的真实标签(行) × 预测标签(列) 3x3 计数矩阵
+CREATE TABLE IF NOT EXISTS eval_matrices (
+    model_id    TEXT NOT NULL,
+    partition   TEXT NOT NULL CHECK (partition IN ('train', 'val')),
+    truth_label TEXT NOT NULL CHECK (truth_label IN ('normal', 'scratch', 'dent')),
+    pred_label  TEXT NOT NULL CHECK (pred_label IN ('normal', 'scratch', 'dent')),
+    count       INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
+    PRIMARY KEY (model_id, partition, truth_label, pred_label)
+);
 """
 
 

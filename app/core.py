@@ -14,12 +14,16 @@
 from __future__ import annotations
 
 import hashlib
+import random
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 
+from . import evaluation
 from .db import bump_version, connect, read_txn, state_version, write_txn
 
-MAX_ATTEMPTS = 6  # 乐观并发校验失败时的最大重分析次数
+MAX_ATTEMPTS = 12  # 乐观并发校验失败时的最大重分析次数
+RETRY_BACKOFF = 0.005  # 每次重分析前的基础退避秒数（按尝试次数线性递增 + 抖动）
 
 
 @dataclass(frozen=True)
@@ -223,6 +227,22 @@ def _conflict_detail(conn, component: dict, partitions: dict[int, str | None]) -
 # ---------------------------------------------------------------------------
 
 def _apply_plan(conn, plan: dict) -> None:
+    # 评估矩阵只随"分区发生变化"的图片调整。先记录所有从（被合并的）未分区
+    # 组迁出的图片：它们随并组继承目标组分区，需要在同一事务内重算贡献。
+    moved_unpartitioned: list[str] = []
+    for comp in plan["components"]:
+        for g in comp["merge_groups"]:
+            moved_unpartitioned.extend(
+                r["image_id"]
+                for r in conn.execute(
+                    "SELECT i.image_id AS image_id FROM images i "
+                    "JOIN groups gr ON gr.group_id = i.group_id "
+                    "WHERE i.group_id = ? AND gr.partition IS NULL",
+                    (g,),
+                )
+            )
+
+    affected: list[str] = list(moved_unpartitioned)
     for comp in plan["components"]:
         target = comp["target_group"]
         if target is None:
@@ -242,17 +262,25 @@ def _apply_plan(conn, plan: dict) -> None:
                     (comp["partition"], target, comp["partition"]),
                 )
         comp["resolved_group"] = target
+        fresh_ids = []
         for r in comp["fresh"]:
             conn.execute(
                 "INSERT INTO images (image_id, workpiece_no, batch_no, content_hash, group_id) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (r.image_id, r.workpiece_no, r.batch_no, r.content_hash, target),
             )
+            fresh_ids.append(r.image_id)
+        # 新图若直接落入已分区组（分区继承），同样只重算这些受影响图片
+        if comp["partition"]:
+            affected.extend(fresh_ids)
+
+    # 与图片关系、分区在同一写事务内同步逐图片贡献与矩阵（增量，非全库重算）
+    evaluation.reconcile_images(conn, affected)
 
 
 def import_rows(rows: list[ImageRow]) -> dict:
     """导入一批图片目录信息。整批原子生效；冲突时整批拒绝。"""
-    for _attempt in range(MAX_ATTEMPTS):
+    for attempt in range(MAX_ATTEMPTS):
         conn = connect()
         try:
             # 阶段 1：只读快照上完成连通分析（不阻塞并发写入）
@@ -276,6 +304,8 @@ def import_rows(rows: list[ImageRow]) -> dict:
                     _apply_plan(conn, plan)
                     new_version = bump_version(conn)
             except _Retry:
+                # 退避后重分析：高并发下错开各导入线程的提交窗口
+                time.sleep(RETRY_BACKOFF * (attempt + 1) * random.uniform(0.5, 1.5))
                 continue
 
             return {
@@ -326,6 +356,15 @@ def assign_partition(image_id: str, partition: str) -> dict:
                 if cur.rowcount == 1:
                     changed = True
                     final_partition = partition
+                    # 整组进入分区：组内每张图片的预测/真值开始形成矩阵贡献，
+                    # 只重算本组图片，并与分区变更在同一事务内原子生效
+                    group_images = [
+                        r["image_id"]
+                        for r in conn.execute(
+                            "SELECT image_id FROM images WHERE group_id = ?", (group_id,)
+                        )
+                    ]
+                    evaluation.reconcile_images(conn, group_images)
                     bump_version(conn)
                 else:  # 防御：BEGIN IMMEDIATE 已串行化，理论上不会走到
                     final_partition = conn.execute(

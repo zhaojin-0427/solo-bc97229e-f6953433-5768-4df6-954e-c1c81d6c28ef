@@ -10,6 +10,12 @@ services:
     volumes:
       - split_data:/data   # SQLite 数据库持久化，容器重启后数据不丢
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
 volumes:
   split_data:
